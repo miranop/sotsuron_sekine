@@ -20,7 +20,7 @@ RUN pip install --no-cache-dir torch torchvision torchaudio --index-url https://
 RUN pip install --no-cache-dir pytorch-lightning lightning torchmetrics
 
 # 基本ライブラリ
-RUN pip install --no-cache-dir numpy pillow matplotlib opencv-python-headless
+RUN pip install --no-cache-dir numpy pillow matplotlib opencv-python-headless pandas seaborn scikit-learn
 
 # 追加の必要ライブラリ（今回の経験から）
 RUN pip install --no-cache-dir kornia scikit-learn scikit-image
