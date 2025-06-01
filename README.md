@@ -1,1 +1,7 @@
-# sotsuron_sekine
+# 卒論研究用コード
+
+## 項目
+
+- dockerfile -> 将来的に GPU 環境に移行させるために書いてます
+- .py のもの -> 基本的にはコード
+- test.py -> docker の動作チェック用
