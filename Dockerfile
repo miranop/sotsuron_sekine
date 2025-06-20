@@ -23,9 +23,11 @@ RUN pip install --no-cache-dir pytorch-lightning lightning torchmetrics
 RUN pip install --no-cache-dir numpy pillow matplotlib opencv-python-headless pandas seaborn scikit-learn
 
 # 追加の必要ライブラリ（今回の経験から）
-RUN pip install --no-cache-dir kornia scikit-learn scikit-image
+RUN pip install --no-cache-dir kornia scikit-learn scikit-image pyshark
 
 # anomalib（最後に）
 RUN pip install --no-cache-dir "anomalib[full]"
 
-CMD ["python"]
+COPY anomalib_test.py .
+
+CMD ["python", "anomalib_test.py"]
