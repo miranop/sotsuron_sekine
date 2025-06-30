@@ -22,7 +22,7 @@ RUN pip install --no-cache-dir pytorch-lightning lightning torchmetrics
 # 基本ライブラリ
 RUN pip install --no-cache-dir numpy pillow matplotlib opencv-python-headless pandas seaborn scikit-learn
 
-# 追加の必要ライブラリ（今回の経験から）
+# 追加ライブラリ(随時更新)
 RUN pip install --no-cache-dir kornia scikit-learn scikit-image pyshark
 
 # anomalib（最後に）

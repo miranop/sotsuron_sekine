@@ -1,5 +1,4 @@
 import os
-from tkinter import Image
 import numpy as np
 import pandas as pd
 from sklearn.preprocessing import MinMaxScaler
@@ -7,6 +6,7 @@ from pyts.image import GramianAngularField
 from PIL import Image 
 
 
+# CSVファイルの読み込み
 df = pd.read_csv("Monday-WorkingHours.pcap_ISCX.csv", header=0)
 print(f"CSVファイルを読み込みました。")
 df.replace([np.inf, -np.inf], np.nan, inplace=True)
@@ -26,16 +26,18 @@ min_len = min(len(f) for f in scaled_features)
 scaled_features = [f[:min_len] for f in scaled_features]
 
 window_size = 32
-num_windows = (min_len - window_size) // window_size
+max_image = 100
+max_possible = (min_len - window_size)
+num_windows = min(max_image, max_possible)
 split_features = []
 for feature in scaled_features:
     windows = [feature[i:i+window_size] for i in range(0, num_windows * window_size, window_size)]
     split_features.append(np.array(windows))
 
-gaf = GramianAngularField(image_size=window_size, method='summation')
+gaf = GramianAngularField(image_size=window_size, method='difference')
 gaf_features = [gaf.fit_transform(f) for f in split_features]
 
-output_dir = "rgb_gaf_images"
+output_dir = "rgb_gaf_images2"
 os.makedirs(output_dir, exist_ok=True)
 for i in range(num_windows):
     r = gaf_features[0][i]

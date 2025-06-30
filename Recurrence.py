@@ -31,10 +31,10 @@ for t, s in zip(ts_rounded, sizes):
 sorted_times = sorted(traffic_per_sec.keys())#時系列にソート
 traffic_values = [traffic_per_sec[t] for t in sorted_times]
 
-rp = RecurrencePlot()
+rp = RecurrencePlot(time_delay=2,threshold='point',dimension=2)
 X_rp = rp.fit_transform(np.array(traffic_values).reshape(1, -1))
 
 plt.imshow(X_rp[0], cmap='binary')
 plt.title("Recurrence Plot from Pcap")
-plt.savefig("recurrence_plot.png")
+plt.savefig("recurrence_plot2.png")
 print("✅ recurrence_plot.png に画像を保存しました")
