@@ -3,41 +3,10 @@ import numpy as np
 from PIL import Image
 import os
 
+import same as same
 
-def read_packet(filepath,count=1000):#パケットを
-    ip_packets = []#分けたIPアドレスの格納用
-    packets = rdpcap(filename=filepath,count=count)
-    
-    for packet in packets:#読み込んだパケットを見る
-        if IP in packet:#パケットの中のIPだけ抜き出す
-            ip_packets.append(packet)#追加
-    return ip_packets
-
-def group_packets(ip_packets):
-    #グループ化
-    #グループ格納のための辞書を用意
-    traffic = {}
-    
-    for packet in ip_packets:
-        src = packet[IP].src
-        dst = packet[IP].dst
-        
-        #送信元と宛先のIPをタプルにして管理
-        ip_pair = (src,dst)
-        
-        if ip_pair not in traffic:
-            traffic[ip_pair] = []
-        
-        # 該当するIPペアのリストにパケットを追加
-        traffic[ip_pair].append(packet)
-        
-    return traffic
 
 def packets_to_images(packet_list, image_dim=64):
-    """
-    パケットのリストを64x64のグレースケール画像のリストに変換します。
-    この時点ではまだ表示はせず、数値データのリストを返します。
-    """
     images = []
     # パケットリストをimage_dim個ずつのチャンクに分割
     for i in range(0, len(packet_list), image_dim):
@@ -70,16 +39,16 @@ def packets_to_images(packet_list, image_dim=64):
 
 def main():
     """メイン処理"""
-    pcap_file = './Monday-WorkingHours.pcap'
+    pcap_file = '../Monday-WorkingHours.pcap'
     output_dir = "traffic_images"
 
     # 1. pcapからIPパケットを読み込む
-    ip_packets = read_packet(pcap_file)
+    ip_packets = same.read_packet(pcap_file)
     if not ip_packets:
         return
 
     # 2. IPペアでパケットをグループ化
-    traffic = group_packets(ip_packets)
+    traffic = same.group_packets(ip_packets)
     
     # 3. トラフィック量でソートし、上位5件を取得
     sorted_traffic = sorted(traffic.items(), key=lambda item: len(item[1]), reverse=True)
