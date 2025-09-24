@@ -1,33 +1,35 @@
-FROM python:3.11-slim
-
+FROM ubuntu:22.04
 WORKDIR /app
 
-# システムライブラリ
+# 非対話的インストール設定
+ENV DEBIAN_FRONTEND=noninteractive
+
+# システム更新とPythonインストール
 RUN apt-get update && apt-get install -y \
-    gcc g++ git curl wget \
-    libglib2.0-0 libgl1-mesa-glx \
-    # 追加: 画像処理用ライブラリ
-    libjpeg-dev libpng-dev libfreetype6-dev \
+    python3 python3-pip python3-dev \
+    gcc g++ git \
+    # OpenCV完全サポート用ライブラリ
+    libgl1-mesa-glx \
+    libgl1-mesa-dev \
+    libglib2.0-0 \
+    libsm6 \
+    libxext6 \
+    libxrender-dev \
+    libgomp1 \
+    # 画像処理用
+    libjpeg-dev libpng-dev \
     && rm -rf /var/lib/apt/lists/*
+
+# Python3をpythonとして使用
+RUN ln -s /usr/bin/python3 /usr/bin/python
 
 # Pythonライブラリを段階的にインストール
 RUN pip install --no-cache-dir --upgrade pip
-
-# PyTorch (CPU版)
 RUN pip install --no-cache-dir torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu
-
-# Lightning関連（両方必要）
 RUN pip install --no-cache-dir pytorch-lightning lightning torchmetrics
-
-# 基本ライブラリ
-RUN pip install --no-cache-dir numpy pillow matplotlib opencv-python-headless pandas seaborn scikit-learn
-
-# 追加ライブラリ(随時更新)
-RUN pip install --no-cache-dir kornia scikit-learn scikit-image pyshark
-
-# anomalib（最後に）
+RUN pip install --no-cache-dir numpy pillow matplotlib opencv-python pandas seaborn scikit-learn
+RUN pip install --no-cache-dir kornia scikit-image pyshark
 RUN pip install --no-cache-dir "anomalib[full]"
 
-COPY anomalib_test.py .
-
-CMD ["python", "anomalib_test.py"]
+COPY . .
+CMD ["/bin/bash"]
