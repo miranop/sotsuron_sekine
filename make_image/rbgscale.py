@@ -1,105 +1,232 @@
-from scapy.all import rdpcap, IP
-import numpy as np
-from PIL import Image
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+CIC-IDS系CSVを MTF(RGB) 画像に変換（BENIGN とそれ以外で分割）
+- 正常（BENIGN） → dataset/train/good/ と dataset/test/good/
+- 異常（BENIGN以外） → dataset/test/anomaly/
+- スケーリングは BENIGN で fit し、両クラスに適用
+"""
+
 import os
+import numpy as np
+import pandas as pd
+from sklearn.preprocessing import MinMaxScaler
+from pyts.image import MarkovTransitionField
+from PIL import Image
 
-import same as same
+# ====== 設定 ======
+CSV_PATH = "Monday-WorkingHours.pcap_ISCX.csv"
 
-# --- ステップ3' RGB画像変換用の新関数 ---
-def packets_to_rgb_images(packet_list, image_dim=64):
-    """パケットのリストを64x64のRGB画像のリストに変換する"""
-    images = []
-    packets_per_image = image_dim * 3  # 1枚の画像に必要なパケット数 (64*3=192)
+# 先頭にスペースが入っているカラム名をそのまま使う（あなたの元コードに合わせています）
+FEATURE_COLUMNS = [" Flow IAT Mean", " Flow Duration", "Flow Bytes/s"]
 
-    # 192パケットずつの塊（チャンク）に分割して処理
-    for i in range(0, len(packet_list), packets_per_image):
-        chunk = packet_list[i:i + packets_per_image]
-        
-        # 64x64x3 のRGB画像データ（numpy配列）を初期化
-        image_data = np.zeros((image_dim, image_dim, 3), dtype=np.uint8)
-        
-        # チャンク内のパケットを画像の各行のRGBに変換
-        for j in range(image_dim): # 0から63までループ (行番号)
-            
-            # 1行分のRGBデータを格納する配列
-            r_row, g_row, b_row = np.zeros(image_dim), np.zeros(image_dim), np.zeros(image_dim)
+LABEL_CANDIDATES = [" Label", "Label", "label", " class", "Class"]  # 環境により列名が異なる対策
+BENIGN_TOKENS = {"BENIGN", "Benign", "benign", "NORMAL", "Normal"}   # 正常を示す候補
 
-            # --- Rチャンネルの処理 ---
-            r_packet_index = j * 3
-            if r_packet_index < len(chunk):
-                packet_r = chunk[r_packet_index]
-                header_bytes_r = bytes(packet_r[IP])
-                padded_bytes_r = header_bytes_r.ljust(image_dim, b'\x00') # 足りない分は黒で埋める
-                truncated_bytes_r = padded_bytes_r[:image_dim]
-                r_row = np.frombuffer(truncated_bytes_r, dtype=np.uint8)
+# 画像化のパラメータ
+WINDOW_SIZE = 32
+MTF_BINS = 2
+MTF_STRATEGY = "uniform"
 
-            # --- Gチャンネルの処理 ---
-            g_packet_index = j * 3 + 1
-            if g_packet_index < len(chunk):
-                packet_g = chunk[g_packet_index]
-                header_bytes_g = bytes(packet_g[IP])
-                padded_bytes_g = header_bytes_g.ljust(image_dim, b'\x00')
-                truncated_bytes_g = padded_bytes_g[:image_dim]
-                g_row = np.frombuffer(truncated_bytes_g, dtype=np.uint8)
+# 出力先
+OUT_ROOT = "dataset"
+TRAIN_GOOD = os.path.join(OUT_ROOT, "train", "good")
+TEST_GOOD = os.path.join(OUT_ROOT, "test", "good")
+TEST_ANOM = os.path.join(OUT_ROOT, "test", "anomaly")
 
-            # --- Bチャンネルの処理 ---
-            b_packet_index = j * 3 + 2
-            if b_packet_index < len(chunk):
-                packet_b = chunk[b_packet_index]
-                header_bytes_b = bytes(packet_b[IP])
-                padded_bytes_b = header_bytes_b.ljust(image_dim, b'\x00')
-                truncated_bytes_b = padded_bytes_b[:image_dim]
-                b_row = np.frombuffer(truncated_bytes_b, dtype=np.uint8)
+# （任意）各分割の最大生成画像数（None なら無制限）
+MAX_IMAGES_TRAIN_GOOD = None
+MAX_IMAGES_TEST_GOOD = None
+MAX_IMAGES_TEST_ANOM = None
+# ===================
 
-            # numpy配列の対応するチャンネルにデータを格納
-            image_data[j, :, 0] = r_row  # j行目のRチャンネル
-            image_data[j, :, 1] = g_row  # j行目のGチャンネル
-            image_data[j, :, 2] = b_row  # j行目のBチャンネル
 
-        images.append(image_data)
-        
-    return images
+def find_label_column(df: pd.DataFrame) -> str:
+    # 候補から最初に見つかったラベル列を返す
+    for cand in LABEL_CANDIDATES:
+        if cand in df.columns:
+            return cand
+    # どれも無ければ、スペース除去・小文字化で推測
+    lower_map = {c.lower().strip(): c for c in df.columns}
+    for cand in ["label", "class", "attack_cat", "attack_type"]:
+        if cand in lower_map:
+            return lower_map[cand]
+    raise ValueError("ラベル列（Label/Class）が見つかりませんでした。LABEL_CANDIDATES を調整してください。")
 
-# --- メイン処理 ---
+
+def ensure_features(df: pd.DataFrame, feature_cols):
+    missing = [c for c in feature_cols if c not in df.columns]
+    if missing:
+        raise ValueError(f"特徴量カラムが見つかりません: {missing}\n"
+                         f"CSVの列名を確認するか FEATURE_COLUMNS を合わせてください。")
+
+
+def split_normal_anomaly(df: pd.DataFrame, label_col: str):
+    # 前処理：無限大→NaN に置換
+    df = df.replace([np.inf, -np.inf], np.nan)
+
+    # ラベル正規化（前後空白削除・文字列化）
+    label_series = df[label_col].astype(str).str.strip()
+
+    # BENIGN 判定
+    is_benign = label_series.isin(BENIGN_TOKENS)
+
+    normal_df = df[is_benign].copy()
+    anomaly_df = df[~is_benign].copy()
+
+    if normal_df.empty:
+        raise ValueError("BENIGN（正常）行が見つかりません。BENIGN_TOKENS を見直してください。")
+    if anomaly_df.empty:
+        print("警告: 異常行がゼロです。今回は正常画像だけを出力します。")
+
+    return normal_df, anomaly_df
+
+
+def fit_scalers_on_normal(normal_df: pd.DataFrame, feature_cols):
+    """ 正常データで MinMaxScaler を学習し、各特徴量ごとに返す """
+    scalers = {}
+    for col in feature_cols:
+        vals = normal_df[col].dropna().values.reshape(-1, 1)
+        if vals.size == 0:
+            raise ValueError(f"正常データ内で {col} に有効値がありません。")
+        scaler = MinMaxScaler()
+        scaler.fit(vals)
+        scalers[col] = scaler
+    return scalers
+
+
+def extract_windows_3ch(df: pd.DataFrame, feature_cols, scalers, window_size: int):
+    """
+    3特徴量をそれぞれスケール → 1D配列 → WINDOW_SIZE ごとの等幅スライディング（非オーバーラップ）で切り出し
+    各チャネルの窓配列（shape: [num_windows, window_size]）を返す
+    """
+    scaled_features = []
+    for col in feature_cols:
+        data = df[col].dropna().values.reshape(-1, 1)
+        if data.size == 0:
+            raise ValueError(f"{col} に有効値がありません。")
+        scaled = scalers[col].transform(data).flatten()
+        scaled_features.append(scaled)
+
+    # 各チャネルの長さを揃える（最小長）
+    min_len = min(len(f) for f in scaled_features)
+    scaled_features = [f[:min_len] for f in scaled_features]
+
+    if min_len < window_size:
+        return None  # 窓が作れない
+
+    # 非オーバーラップ窓
+    num_windows = min_len // window_size
+    if num_windows == 0:
+        return None
+
+    windows_per_channel = []
+    for feat in scaled_features:
+        windows = [feat[i * window_size:(i + 1) * window_size] for i in range(num_windows)]
+        windows_per_channel.append(np.asarray(windows))  # [num_windows, window_size]
+
+    return windows_per_channel  # リスト長3（R,G,B）
+
+
+def mtf_rgb_from_3ch_windows(windows_per_channel, image_size, n_bins=2, strategy="uniform"):
+    """
+    各チャネルの [num_windows, window_size] → MTF → [num_windows, image_size, image_size]
+    を 3チャネル（R,G,B）にして RGB 画像配列を返す（uint8, 0-255）
+    """
+    mtf = MarkovTransitionField(image_size=image_size, n_bins=n_bins, strategy=strategy)
+
+    # 各チャネルを MTF 変換
+    mtf_channels = []
+    for ch in windows_per_channel:
+        # ch: [num_windows, window_size]
+        mtf_ch = mtf.fit_transform(ch)  # [num_windows, image_size, image_size], 値域は [-1,1] 相当
+        mtf_channels.append(mtf_ch)
+
+    # 3つ揃っていることを保証
+    assert len(mtf_channels) == 3
+    num_windows = mtf_channels[0].shape[0]
+
+    # RGB へ
+    rgb_list = []
+    for i in range(num_windows):
+        r = mtf_channels[0][i]
+        g = mtf_channels[1][i]
+        b = mtf_channels[2][i]
+        rgb = np.stack([r, g, b], axis=-1)  # [-1,1]の想定
+        rgb = ((rgb + 1) / 2.0 * 255.0).clip(0, 255).astype(np.uint8)
+        rgb_list.append(rgb)
+    return rgb_list  # 長さ num_windows, 各 [H,W,3]
+
+
+def save_images(rgb_list, out_dir, prefix="img", max_images=None, start_index=0):
+    os.makedirs(out_dir, exist_ok=True)
+    count = 0
+    for idx, rgb in enumerate(rgb_list):
+        if max_images is not None and count >= max_images:
+            break
+        fname = f"{prefix}_{start_index + idx:06d}.png"
+        Image.fromarray(rgb).save(os.path.join(out_dir, fname))
+        count += 1
+    return count
+
+
 def main():
-    """メイン処理"""
-    pcap_file = '../Monday-WorkingHours.pcap'
-    output_dir = "traffic_images_rgb" # 保存先フォルダ名を変更
+    # === 1) ロード & チェック ===
+    df = pd.read_csv(CSV_PATH)
+    print("CSVファイルを読み込みました。")
 
-    # 1, 2. パケット読み込みとグループ化 (変更なし)
-    ip_packets = same.read_packet(pcap_file)
-    if not ip_packets:
-        return
-    traffic = same.group_packets(ip_packets)
-    
-    # 3. トラフィック量でソート
-    sorted_traffic = sorted(traffic.items(), key=lambda item: len(item[1]), reverse=True)
-    
-    # 4. 出力用フォルダを作成
-    if not os.path.exists(output_dir):
-        os.makedirs(output_dir)
-        print(f"Created directory: '{output_dir}'")
+    # ラベル列の特定
+    label_col = find_label_column(df)
+    print(f"ラベル列: {label_col!r}")
 
-    # 5. トラフィックをRGB画像に変換して保存
-    print("\n--- Converting traffic to RGB images and saving ---")
-    for ip_pair, packets in sorted_traffic:
-        # 192パケット（=RGB画像1枚分）以上の通信のみを対象
-        if len(packets) >= 192:
-            image_list = packets_to_rgb_images(packets)
-            
-            ip1_sanitized = ip_pair[0].replace('.', '_')
-            ip2_sanitized = ip_pair[1].replace('.', '_')
-            base_filename = f"{ip1_sanitized}_{ip2_sanitized}"
+    # 特徴量の存在チェック
+    ensure_features(df, FEATURE_COLUMNS)
 
-            for idx, image_data in enumerate(image_list):
-                # NumPy配列をPillowのImageオブジェクトに変換 (モードを'RGB'に変更)
-                img = Image.fromarray(image_data, 'RGB') 
-                
-                filename = os.path.join(output_dir, f"{base_filename}_{idx}.png")
-                img.save(filename)
-            
-            print(f"Saved {len(image_list)} RGB images for {ip_pair[0]} <-> {ip_pair[1]}")
-    print("---------------------------------------------")
+    # === 2) 正常/異常 に分割 ===
+    normal_df, anomaly_df = split_normal_anomaly(df, label_col)
+    print(f"正常行: {len(normal_df)}  異常行: {len(anomaly_df)}")
+
+    # === 3) 正常でスケーラーを学習 ===
+    scalers = fit_scalers_on_normal(normal_df, FEATURE_COLUMNS)
+    print("MinMaxScaler を正常データで fit 済み。")
+
+    # === 4) 正常→ train/good & test/good ===
+    win_normal = extract_windows_3ch(normal_df, FEATURE_COLUMNS, scalers, WINDOW_SIZE)
+    if win_normal is None:
+        raise RuntimeError("正常データから窓が作れませんでした。WINDOW_SIZE を小さくしてください。")
+
+    rgb_normal = mtf_rgb_from_3ch_windows(win_normal, image_size=WINDOW_SIZE,
+                                          n_bins=MTF_BINS, strategy=MTF_STRATEGY)
+
+    # まず学習用：すべて or 一部
+    n_train = save_images(rgb_normal, TRAIN_GOOD, prefix="rgb_mtf_train_good",
+                          max_images=MAX_IMAGES_TRAIN_GOOD, start_index=0)
+    print(f"train/good: {n_train} 枚保存")
+
+    # 残りをテスト用に回す（MAX を設定した場合）
+    rest_normal = rgb_normal[n_train:] if MAX_IMAGES_TRAIN_GOOD is not None else rgb_normal
+    n_test_good = save_images(rest_normal, TEST_GOOD, prefix="rgb_mtf_test_good",
+                              max_images=MAX_IMAGES_TEST_GOOD, start_index=0)
+    print(f"test/good: {n_test_good} 枚保存")
+
+    # === 5) 異常→ test/anomaly ===
+    n_test_anom = 0
+    if not anomaly_df.empty:
+        win_anom = extract_windows_3ch(anomaly_df, FEATURE_COLUMNS, scalers, WINDOW_SIZE)
+        if win_anom is None:
+            print("警告: 異常データから窓が作れなかったため、test/anomaly は 0 枚です。")
+        else:
+            rgb_anom = mtf_rgb_from_3ch_windows(win_anom, image_size=WINDOW_SIZE,
+                                                n_bins=MTF_BINS, strategy=MTF_STRATEGY)
+            n_test_anom = save_images(rgb_anom, TEST_ANOM, prefix="rgb_mtf_test_anomaly",
+                                      max_images=MAX_IMAGES_TEST_ANOM, start_index=0)
+    print(f"test/anomaly: {n_test_anom} 枚保存")
+
+    print("\n完了：anomalib 用フォルダが整いました。構成は以下の通りです：")
+    print(f"- {TRAIN_GOOD}/  ... 正常（学習）")
+    print(f"- {TEST_GOOD}/   ... 正常（テスト）")
+    print(f"- {TEST_ANOM}/   ... 異常（テスト）")
+
 
 if __name__ == "__main__":
     main()
