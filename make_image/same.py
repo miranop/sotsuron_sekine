@@ -1,36 +1,75 @@
-#処理の共通部分を記しておく
-from scapy.all import rdpcap, IP
+# same.py
+import dpkt
+import socket
+from datetime import datetime, timedelta, timezone
 
-def read_packet(filepath,count=1000):#パケットを
-    try:
-        ip_packets = []#分けたIPアドレスの格納用
-        packets = rdpcap(filepath,count=count)
-    except FileNotFoundError:
-        print(f"Error: pcap file not found at '{filepath}'")
-        return []
-    
-    
-    for packet in packets:#読み込んだパケットを見る
-        if IP in packet:#パケットの中のIPだけ抜き出す
-            ip_packets.append(packet)#追加
-    return ip_packets
 
-def group_packets(ip_packets):
-    #グループ化
-    #グループ格納のための辞書を用意
+def read_packet_dpkt(filepath, time_filter=None, count_limit=None, tz_offset=0):
+    """
+    dpktでpcapを読み込み、1パケットごとにdictで返す
+    timestampはdatetime（tz_offset補正済み）
+    """
+    from datetime import datetime, timezone, timedelta
+    import dpkt
+    import socket
+
+    packets = []
+    count = 0
+    offset = timedelta(hours=tz_offset)  # ← これを追加
+
+    print(f"  dpktでpcap読み込み開始...")
+
+    with open(filepath, 'rb') as f:
+        try:
+            pcap = dpkt.pcap.Reader(f)
+        except:
+            f.seek(0)
+            pcap = dpkt.pcapng.Reader(f)
+
+        for timestamp, buf in pcap:
+            if count_limit and count >= count_limit:
+                break
+
+            # UTCからオフセットを適用してローカル時刻に変換
+            dt_local = datetime.fromtimestamp(
+                timestamp, tz=timezone.utc) + offset
+            hour = dt_local.hour
+
+            # time_filterで範囲を制限（オプション）
+            if time_filter and not (time_filter[0] <= hour < time_filter[1]):
+                continue
+
+            try:
+                eth = dpkt.ethernet.Ethernet(buf)
+                if not isinstance(eth.data, dpkt.ip.IP):
+                    continue
+                ip = eth.data
+                src_ip = socket.inet_ntoa(ip.src)
+                dst_ip = socket.inet_ntoa(ip.dst)
+
+                packets.append({
+                    'timestamp': dt_local,
+                    'src_ip': src_ip,
+                    'dst_ip': dst_ip,
+                    'bytes': bytes(ip)
+                })
+
+                count += 1
+                if count % 100000 == 0:
+                    print(f"    読み込み済み: {count:,} パケット")
+
+            except Exception:
+                continue
+
+    print(f"  ✓ 読み込み完了: {len(packets):,} パケット")
+    return packets
+
+
+def group_packets_dpkt(packets):
     traffic = {}
-    
-    for packet in ip_packets:
-        src = packet[IP].src
-        dst = packet[IP].dst
-        
-        #送信元と宛先のIPをタプルにして管理
-        ip_pair = (src,dst)
-        
-        if ip_pair not in traffic:
-            traffic[ip_pair] = []
-        
-        # 該当するIPペアのリストにパケットを追加
-        traffic[ip_pair].append(packet)
-        
+    for pkt in packets:
+        pair = (pkt["src_ip"], pkt["dst_ip"])
+        if pair not in traffic:
+            traffic[pair] = []
+        traffic[pair].append(pkt)
     return traffic
