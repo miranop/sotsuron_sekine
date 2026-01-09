@@ -1,200 +1,256 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-CIC-IDS2017 の pcap から Recurrence Plot 画像を生成（改良版）
- - 小窓化 (256秒)
- - STRIDE=64秒
- - log1pスケーリングで安定化
- - 既存画像スキップ対応
+PCAP(バイト列) → Recurrence Plot 画像生成スクリプト
+特徴: PAA平滑化により、バイト列の「繰り返しパターン」を可視化
 """
 
 import os
 import sys
-import math
-import numpy as np
-from datetime import datetime
+import random
+import shutil
 from collections import defaultdict
-from pyts.image import RecurrencePlot
-from tqdm import tqdm
+from datetime import datetime
+import warnings
+
+import numpy as np
 from PIL import Image
+from tqdm import tqdm
+from pyts.image import RecurrencePlot
 
-import same         # same.read_packet_dpkt, same.group_packets_dpkt
-import label        # label.get_label, ATTACK_SCHEDULES
-from label import ATTACK_SCHEDULES
+# 警告抑制
+warnings.filterwarnings('ignore')
 
-sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+# ===== パス設定 (ModuleNotFoundError回避) =====
+sys.path.append(os.path.abspath(os.path.join(
+    os.path.dirname(__file__), "../make_image")))
+
+try:
+    import same
+    import label
+except ImportError:
+    print("❌ エラー: 'same.py' または 'label.py' が見つかりません。")
+    print("   export PYTHONPATH=$PYTHONPATH:../make_image を実行してください。")
+    sys.exit(1)
 
 # ===== 設定 =====
 PCAP_DIR = "../Pcap"
-OUT_ROOT = "../datasets/rp"
+OUT_ROOT = "../datasets/pcap_rp"  # 出力先
 TRAIN_GOOD = os.path.join(OUT_ROOT, "train", "good")
 TEST_GOOD = os.path.join(OUT_ROOT, "test", "good")
 TEST_ANOM_ROOT = os.path.join(OUT_ROOT, "test", "anomaly")
 
-IMAGE_DIM = 64        # 出力画像サイズ
-WINDOW_SIZE = 256     # 1枚の画像に使う「秒」の長さ（← 小窓化）
-STRIDE = 64           # スライディングウィンドウのステップ（秒）
-TZ_OFFSET_HOURS = -3  # CIC-IDS2017の現地時間補正（Atlantic）
+# ★ RP生成のコア設定 ★
+# 1画像を作るために読み込むバイト数
+# 例: 512バイト読んで、PAAで64点に圧縮し、64x64のRP行列を作る
+RAW_BYTES_LEN = 512
+RP_MATRIX_SIZE = 64  # RPの計算サイズ (小さいほうが高速)
+PAA_WINDOW = RAW_BYTES_LEN // RP_MATRIX_SIZE  # 自動計算 (8バイト平均)
 
-# ===== ユーティリティ =====
+# 保存する画像の解像度 (CNNに入力するサイズ)
+IMAGE_DIM = 256
 
+# データ分割設定
+TRAIN_RATIO = 0.7
+RANDOM_SEED = 42
+MAX_IMAGES_TRAIN_GOOD = 2000
+MAX_IMAGES_TEST_GOOD = 1000
+MAX_IMAGES_PER_ATTACK_TEST = 400
+MIN_IMAGES_PER_ATTACK_TEST = 20
+MOVE_RATIO_FROM_TEST_TO_TRAIN = 0.6
+TZ_OFFSET_HOURS = -3
 
-def _to_epoch_seconds(ts_obj):
-    if isinstance(ts_obj, (int, float)):
-        return float(ts_obj)
-    if isinstance(ts_obj, datetime):
-        return ts_obj.timestamp()
-    raise TypeError(f"Unsupported timestamp type: {type(ts_obj)}")
-
-
-def _label_from_timestamp(ts_obj, pcap_filename):
-    ts = _to_epoch_seconds(ts_obj)
-    return label.get_label(ts, pcap_filename)
-
-
-def _sanitize(label_str):
-    return label_str.replace(" ", "_").replace("-", "_").replace("/", "_")
-
-# ===== 主要処理 =====
+random.seed(RANDOM_SEED)
+np.random.seed(RANDOM_SEED)
 
 
-def extract_series_per_second(packets, pcap_filename):
-    """
-    1秒ごとの合計バイト数の系列とその代表ラベルを返す
-    """
-    if not packets:
-        return np.array([]), []
+# ===== 関数定義 =====
 
-    traffic_per_sec = defaultdict(int)
-    label_per_sec = {}
+def apply_paa_1d(array, target_length, window_size):
+    """修正版: 0パディングではなく、データを繰り返して埋める"""
+    length = target_length * window_size
 
-    for pkt in packets:
-        try:
-            ts = pkt["timestamp"]
-            size = len(pkt["bytes"])
-            sec = math.floor(_to_epoch_seconds(ts))
-            traffic_per_sec[sec] += size
-            label_per_sec[sec] = _label_from_timestamp(ts, pcap_filename)
-        except Exception:
+    if len(array) < length:
+        # 足りない分を、自分自身の繰り返しで埋める
+        # 例: [1,2] -> [1,2,1,2,1,2...]
+        repeats = (length // len(array)) + 1
+        array = np.tile(array, repeats)[:length]
+    else:
+        array = array[:length]
+
+    return array.reshape(target_length, window_size).mean(axis=1)
+
+
+def generate_rp_from_bytes(data_bytes, out_dim=256):
+    """バイト列からRP画像を生成"""
+    try:
+        # バイト列を数値(0-255)の配列に変換
+        arr = np.frombuffer(data_bytes, dtype=np.uint8)
+
+        # 何もデータがない場合
+        if len(arr) == 0:
+            return Image.new('L', (out_dim, out_dim), 0)
+
+        # 1. PAAで縮小 (例: 512 -> 64)
+        # 数値の変動トレンドを見るため、floatにしておく
+        smoothed = apply_paa_1d(arr.astype(float), RP_MATRIX_SIZE, PAA_WINDOW)
+
+        # 2. RP変換
+        # threshold=None: 距離そのものを輝度にする（グレースケールRP）
+        rp = RecurrencePlot(threshold=None, dimension=1)
+        rp_matrix = rp.fit_transform(smoothed.reshape(1, -1))[0]
+
+        # 3. 画像化 (0-255)
+        rp_img = (rp_matrix * 255).astype(np.uint8)
+        img = Image.fromarray(rp_img)
+
+        # 4. リサイズ (例: 64x64 -> 256x256)
+        if img.size != (out_dim, out_dim):
+            img = img.resize((out_dim, out_dim), Image.NEAREST)
+
+        return img
+
+    except Exception:
+        return Image.new('L', (out_dim, out_dim), 0)
+
+
+def packet_list_to_rp_images(packet_list, pcap_filename):
+    """パケットリストからRP画像を生成"""
+    images_with_labels = []
+    packet_list.sort(key=lambda p: p["timestamp"])
+
+    # パケットごとに画像を生成するか、複数をまとめるか
+    # ここでは「1パケットのペイロード」から「1枚のRP」を作るロジックにします
+    # (攻撃の特徴は1パケットの中身に出やすいため)
+
+    for pkt in packet_list:
+        payload = pkt["bytes"]
+        timestamp = pkt["timestamp"]
+
+        # ペイロードが短すぎるパケットはスキップ（ARPやACKのみなど）
+        if len(payload) < 32:
             continue
 
-    if not traffic_per_sec:
-        return np.array([]), []
+        try:
+            label_value = label.get_label(timestamp, pcap_filename)
+        except Exception:
+            label_value = "BENIGN"
 
-    secs_sorted = sorted(traffic_per_sec.keys())
-    series = np.array([traffic_per_sec[s]
-                      for s in secs_sorted], dtype=np.float32)
-    labels = [label_per_sec[s] for s in secs_sorted]
+        # 画像生成
+        # 先頭から RAW_BYTES_LEN だけ切り出して使う
+        target_bytes = payload[:RAW_BYTES_LEN]
+        img = generate_rp_from_bytes(target_bytes, IMAGE_DIM)
 
-    # --- logスケーリングで値域を圧縮 ---
-    series = np.log1p(series)
-    # --- 正規化（0〜1） ---
-    min_val, max_val = np.min(series), np.max(series)
-    if max_val - min_val > 1e-8:
-        series = (series - min_val) / (max_val - min_val)
-    else:
-        series = np.zeros_like(series)
-    return series, labels
+        # 画像データをnumpy配列として保持しないと処理が重くなるため
+        # ここではPIL Imageオブジェクトのままリストに入れる
+        images_with_labels.append((img, label_value))
+
+    return images_with_labels
 
 
-def save_rp_image(data_1d, label_value, pcap_name, idx, is_train):
-    """Recurrence Plot画像を保存（既存はスキップ）"""
-    if label_value == "BENIGN":
-        out_dir = TRAIN_GOOD if is_train else TEST_GOOD
-        filename = f"{pcap_name}_{'train' if is_train else 'test'}_{idx:06d}.png"
-    else:
-        sanitized = _sanitize(label_value)
-        out_dir = os.path.join(TEST_ANOM_ROOT, sanitized)
-        filename = f"{pcap_name}_{sanitized}_{idx:06d}.png"
+def save_images(images_with_labels, pcap_name, is_train, label_counters):
+    saved_counts = defaultdict(int)
 
-    os.makedirs(out_dir, exist_ok=True)
-    filepath = os.path.join(out_dir, filename)
-    if os.path.exists(filepath):
-        return False
+    for idx, (img, label_value) in enumerate(images_with_labels):
+        if label_value == "BENIGN":
+            if is_train:
+                key = "train_good"
+                max_c = MAX_IMAGES_TRAIN_GOOD
+                d = TRAIN_GOOD
+            else:
+                key = "test_good"
+                max_c = MAX_IMAGES_TEST_GOOD
+                d = TEST_GOOD
+            fname = f"{pcap_name}_{key}_{idx:06d}.png"
+        else:
+            if is_train:
+                continue
+            key = f"test_anom_{label_value}"
+            max_c = MAX_IMAGES_PER_ATTACK_TEST
+            sanitized = label_value.replace(" ", "_").replace("/", "_")
+            d = os.path.join(TEST_ANOM_ROOT, sanitized)
+            fname = f"{pcap_name}_{sanitized}_{idx:06d}.png"
 
-    rp = RecurrencePlot(threshold=None, dimension=1)
-    rp_img = rp.fit_transform(data_1d.reshape(1, -1))[0]
-    rp_img = (rp_img * 255).astype(np.uint8)
+        if label_counters[key] >= max_c:
+            continue
 
-    im = Image.fromarray(rp_img)
-    if im.size != (IMAGE_DIM, IMAGE_DIM):
-        im = im.resize((IMAGE_DIM, IMAGE_DIM), resample=Image.NEAREST)
-    im.save(filepath)
-    return True
+        os.makedirs(d, exist_ok=True)
+        path = os.path.join(d, fname)
+
+        if not os.path.exists(path):
+            img.save(path)
+            saved_counts[key] += 1
+            label_counters[key] += 1
+
+    return saved_counts
+
+# ===== メイン処理 =====
 
 
 def main():
-    print("=" * 80)
-    print("🔹 pcap → Recurrence Plot 画像生成（log正規化 + 小窓化）")
-    print("=" * 80)
+    print("="*80)
+    print(f"PCAP → RP画像変換 (Byte-level Recurrence Plot)")
+    print(
+        f"  Input: {RAW_BYTES_LEN} bytes -> PAA -> {RP_MATRIX_SIZE}x{RP_MATRIX_SIZE} Matrix")
+    print("="*80)
 
     pcap_files = [
-        {"path": os.path.join(PCAP_DIR, "Monday-WorkingHours.pcap"),
-         "is_train": True,  "time_filter": None},
-        {"path": os.path.join(PCAP_DIR, "Tuesday-WorkingHours.pcap"),
-         "is_train": False, "time_filter": None},
-        {"path": os.path.join(PCAP_DIR, "Wednesday-workingHours.pcap"),
-         "is_train": False, "time_filter": None},
-        {"path": os.path.join(PCAP_DIR, "Thursday-WorkingHours.pcap"),
-         "is_train": False, "time_filter": None},
-        {"path": os.path.join(PCAP_DIR, "Friday-WorkingHours.pcap"),
-         "is_train": False, "time_filter": None},
+        {"path": os.path.join(PCAP_DIR, f), "is_train": False}
+        for f in os.listdir(PCAP_DIR) if f.endswith(".pcap")
     ]
 
-    total_counts = {"train/good": 0, "test/good": 0}
-    attack_counts = defaultdict(int)
+    # Train/Test分割
+    monday = [f for f in pcap_files if "monday" in f["path"].lower()]
+    others = [f for f in pcap_files if "monday" not in f["path"].lower()]
+    random.shuffle(others)
+    split = int(len(others) * TRAIN_RATIO)
+    train_files = monday + others[:split]
+    test_files = others[split:]
 
-    for info in pcap_files:
+    for f in train_files:
+        f["is_train"] = True
+
+    all_files = train_files + test_files
+    counters = defaultdict(int)
+
+    for info in all_files:
         path = info["path"]
-        is_train = info["is_train"]
-        time_filter = info["time_filter"]
         if not os.path.exists(path):
-            print(f"⚠ スキップ（見つからない）: {path}")
+            print(f"Skip: {path}")
             continue
 
-        pcap_name = os.path.splitext(os.path.basename(path))[0]
-        print(f"\n▶ {pcap_name} 読み込み中…")
+        print(
+            f"\n処理中: {os.path.basename(path)} ({'Train' if info['is_train'] else 'Test'})")
 
-        packets = same.read_packet_dpkt(
-            path, time_filter=time_filter, tz_offset=TZ_OFFSET_HOURS)
+        try:
+            packets = same.read_packet_dpkt(path, tz_offset=TZ_OFFSET_HOURS)
+        except:
+            continue
+
         if not packets:
-            print("  パケットなし。スキップ。")
             continue
 
+        # グルーピング
         traffic = same.group_packets_dpkt(packets)
-        print(f"  IPペア数: {len(traffic)}")
 
-        produced = 0
-        for ip_pair, pkt_list in tqdm(traffic.items(), desc=f"  {pcap_name} 処理中", leave=False):
-            series, labels = extract_series_per_second(pkt_list, path)
-            if len(series) < WINDOW_SIZE:
-                continue
+        # 生成
+        for _, pkts in tqdm(traffic.items(), leave=False):
+            imgs = packet_list_to_rp_images(pkts, path)
+            if imgs:
+                save_images(imgs, os.path.splitext(os.path.basename(path))[
+                            0], info["is_train"], counters)
 
-            i = 0
-            while i + WINDOW_SIZE <= len(series):
-                window = series[i:i + WINDOW_SIZE]
-                label_value = labels[min(i + WINDOW_SIZE - 1, len(labels) - 1)]
-                idx = (i // STRIDE)
+    # 再配分
+    if MOVE_RATIO_FROM_TEST_TO_TRAIN > 0:
+        print("\n再配分処理...")
+        test_imgs = [f for f in os.listdir(TEST_GOOD) if f.endswith('.png')]
+        random.shuffle(test_imgs)
+        for f in test_imgs[:int(len(test_imgs)*MOVE_RATIO_FROM_TEST_TO_TRAIN)]:
+            shutil.move(os.path.join(TEST_GOOD, f),
+                        os.path.join(TRAIN_GOOD, f))
 
-                if save_rp_image(window, label_value, pcap_name, idx, is_train):
-                    if label_value == "BENIGN":
-                        key = "train/good" if is_train else "test/good"
-                        total_counts[key] += 1
-                    else:
-                        attack_counts[label_value] += 1
-                    produced += 1
-
-                i += STRIDE
-
-        print(f"  生成枚数: {produced:,}")
-
-    print("\n=== ✅ 生成完了 ===")
-    print(f"train/good: {total_counts['train/good']:,}")
-    print(f"test/good : {total_counts['test/good']:,}")
-    for k in sorted(attack_counts.keys()):
-        print(f"{k:30s}: {attack_counts[k]:,}")
-    print(f"\n出力先: {OUT_ROOT}")
-    print("=" * 80)
+    print("\n完了")
+    print(f"出力: {OUT_ROOT}")
 
 
 if __name__ == "__main__":

@@ -1,31 +1,41 @@
-FROM ubuntu:22.04
-WORKDIR /app
-ENV DEBIAN_FRONTEND=noninteractive
+FROM nvidia/cuda:12.1.1-cudnn8-devel-ubuntu22.04
 
-# 必要なシステムパッケージをインストール
-RUN apt-get update && apt-get install -y \
-    python3 python3-pip python3-dev \
-    gcc g++ \
-    libgl1-mesa-glx \
-    libglib2.0-0 \
-    libsm6 \
-    libxext6 \
-    libxrender-dev \
-    libjpeg-dev libpng-dev \
-    libpcap-dev \
-    tcpdump \
-    && rm -rf /var/lib/apt/lists/*
+# 基本
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    python3 python3-pip python3-venv git wget unzip nano vim \
+    libgl1-mesa-glx libglib2.0-0 ffmpeg && \
+    rm -rf /var/lib/apt/lists/*
 
-# Pythonのシンボリックリンク作成
-RUN ln -sf /usr/bin/python3 /usr/bin/python
+RUN ln -s /usr/bin/python3 /usr/bin/python
+RUN pip install --upgrade pip
 
-# Pythonパッケージをインストール
-RUN pip install --no-cache-dir --upgrade pip && \
-    pip install --no-cache-dir \
-    pandas numpy scikit-learn pyts pillow \
+# PyTorch (CUDA12)
+RUN pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
+
+# Anomalib & CV
+RUN pip install \
+    anomalib \
+    opencv-python \
+    scikit-learn \
+    scikit-image \
     matplotlib \
-    scapy \
-    anomalib
+    seaborn \
+    pillow \
+    tqdm \
+    pandas \
+    numpy \
+    einops \
+    wandb \
+    tensorboard
 
-# コマンド（最後に独立して配置）
+# あなた用の追加ツール（GAF / RP）
+RUN pip install \
+    pyts
+
+# コードを内包する場所
+WORKDIR /workspace
+
+# test_code を丸ごとコピー
+COPY ./test_code /workspace/test_code
+
 CMD ["/bin/bash"]

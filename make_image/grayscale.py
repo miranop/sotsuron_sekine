@@ -1,375 +1,269 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-グレースケール画像生成スクリプト - 修正版
-
-主な修正:
-1. データリーク対策: IPペアでグループ化せず時系列処理
-2. メモリ効率化: ジェネレータでバッチ処理
-3. データ不均衡対策: ラベルごとの最大画像数制限
-4. 進捗表示の追加
-5. 既存ファイルスキップの効率化
+グレースケール画像生成スクリプト - ヘッダ限定版 (Header Only)
+特徴: 暗号化されたペイロードを捨て、ヘッダ構造のみを画像化して精度向上を狙う
 """
 
 import os
 import sys
-from PIL import Image
+import random
+import shutil
+from collections import defaultdict
+from datetime import datetime
+import warnings
+
 import numpy as np
+from PIL import Image
 from tqdm import tqdm
+import dpkt  # pip install dpkt
 
-import same
-import label
+# 警告抑制
+warnings.filterwarnings('ignore')
 
-sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+# ===== パス設定 =====
+sys.path.append(os.path.abspath(os.path.join(
+    os.path.dirname(__file__), "../make_image")))
 
-IMAGE_DIM = 64
+try:
+    import same
+    import label
+except ImportError:
+    print("❌ エラー: 'same.py' または 'label.py' が見つかりません。")
+    print("   export PYTHONPATH=$PYTHONPATH:../make_image を実行してください。")
+    sys.exit(1)
+
+# ===== 設定 =====
+IMAGE_DIM = 32
 PCAP_DIR = "../Pcap"
-OUT_ROOT = "../datasets/grayscale"
+OUT_ROOT = "../datasets/grayscale_header"  # 出力先を変更
 TRAIN_GOOD = os.path.join(OUT_ROOT, "train", "good")
 TEST_GOOD = os.path.join(OUT_ROOT, "test", "good")
 TEST_ANOM_ROOT = os.path.join(OUT_ROOT, "test", "anomaly")
 
-# データ不均衡対策: ラベルごとの最大画像数
-MAX_IMAGES_PER_LABEL = {
-    "BENIGN_train": 5000,  # 学習用正常
-    "BENIGN_test": 2000,   # テスト用正常
-    "default": 1000        # その他の攻撃タイプ
-}
+# データ分割設定
+TRAIN_RATIO = 0.7
+RANDOM_SEED = 42
+MAX_IMAGES_TRAIN_GOOD = 5000
+MAX_IMAGES_TEST_GOOD = 2000
+MAX_IMAGES_PER_ATTACK_TRAIN = 800
+MAX_IMAGES_PER_ATTACK_TEST = 400
+MIN_IMAGES_PER_ATTACK_TEST = 20
+MOVE_RATIO_FROM_TEST_TO_TRAIN = 0.6
+TZ_OFFSET_HOURS = -3
+
+random.seed(RANDOM_SEED)
+np.random.seed(RANDOM_SEED)
+
+
+# ===== ヘッダ抽出ロジック =====
+def extract_headers(raw_bytes):
+    """
+    パケットの生データからヘッダ部分(Ethernet + IP + TCP/UDP)のみを抽出・結合する。
+    ペイロード(データ中身)は捨てる。
+    """
+    try:
+        # Ethernetフレームとして解析
+        eth = dpkt.ethernet.Ethernet(raw_bytes)
+
+        # IPパケットでない場合は、とりあえず先頭54バイト(一般的なヘッダ長)を返す
+        if not isinstance(eth.data, dpkt.ip.IP):
+            return raw_bytes[:54]
+
+        ip = eth.data
+        ip_header_len = ip.hl * 4
+
+        trans = ip.data
+        trans_header_len = 0
+
+        if isinstance(trans, dpkt.tcp.TCP):
+            trans_header_len = trans.off * 4
+        elif isinstance(trans, dpkt.udp.UDP):
+            trans_header_len = 8
+        elif isinstance(trans, dpkt.icmp.ICMP):
+            trans_header_len = 8
+
+        # 抽出したい全長 = Eth(14) + IPヘッダ長 + トランスポートヘッダ長
+        total_header_len = 14 + ip_header_len + trans_header_len
+
+        return raw_bytes[:total_header_len]
+
+    except Exception:
+        # 解析エラー時は安全策として先頭54バイトを返す
+        return raw_bytes[:54]
+
+
+# ===== ラベル関連 =====
+def _to_epoch_seconds(ts_obj):
+    if isinstance(ts_obj, (int, float)):
+        return float(ts_obj)
+    if isinstance(ts_obj, datetime):
+        return ts_obj.timestamp()
+    raise TypeError(f"Unsupported timestamp type: {type(ts_obj)}")
+
+
+def _label_from_timestamp(ts_obj, pcap_filename):
+    ts = _to_epoch_seconds(ts_obj)
+    return label.get_label(ts, pcap_filename)
 
 
 def sanitize_label(label_str):
-    return label_str.replace(" ", "_").replace("-", "_").replace("/", "_")
+    return label_str.replace(" ", "_").replace("/", "_")
 
 
-def packet_batch_to_images(packet_batch, pcap_filename, image_dim=64):
-    """
-    パケットバッチから画像を生成（時系列順を保持）
+def count_images_in_directory(directory):
+    if not os.path.exists(directory):
+        return 0
+    return len([f for f in os.listdir(directory) if f.lower().endswith('.png')])
 
-    修正点:
-    - IPペアでグループ化しない
-    - 時系列順に連続したパケットで画像生成
-    - tz_offset引数を削除（same.pyで既に処理済み）
-    """
+
+def split_pcap_files(pcap_files, train_ratio=0.7):
+    monday = [f for f in pcap_files if "monday" in f["path"].lower()]
+    others = [f for f in pcap_files if "monday" not in f["path"].lower()]
+    random.shuffle(others)
+    split = int(len(others) * train_ratio)
+    t = monday + others[:split]
+    e = others[split:]
+    for f in t:
+        f["is_train"] = True
+    for f in e:
+        f["is_train"] = False
+    return t, e
+
+
+# ===== 画像生成ロジック =====
+def packet_list_to_gray_images(packet_list, pcap_filename, image_dim=64):
+    """ヘッダのみを用いてグレースケール画像を生成"""
     images_with_labels = []
+    packet_list.sort(key=lambda p: p["timestamp"])
 
-    # パケットを時系列順にソート（念のため）
-    packet_batch.sort(key=lambda p: p['timestamp'])
+    if len(packet_list) == 0:
+        return []
 
-    # 連続したパケットで画像生成
-    for i in range(0, len(packet_batch), image_dim):
-        chunk = packet_batch[i:i + image_dim]
+    for i in range(0, len(packet_list), image_dim):
+        chunk = packet_list[i:i + image_dim]
 
-        if len(chunk) < image_dim:
-            # パケット数が不足している場合はスキップ
-            continue
-
-        image_data = np.zeros((image_dim, image_dim), dtype=np.uint8)
-
-        # 最初のパケットのタイムスタンプとラベルを取得
         first_packet = chunk[0]
-        timestamp = first_packet['timestamp']
+        timestamp = first_packet["timestamp"]
 
         try:
-            # label.get_labelの引数を確認して呼び出し
-            try:
-                label_value = label.get_label(
-                    timestamp, pcap_filename, tz_offset_hours=-3)
-            except TypeError:
-                try:
-                    label_value = label.get_label(
-                        timestamp, pcap_filename, tz_offset=-3)
-                except TypeError:
-                    label_value = label.get_label(timestamp, pcap_filename)
-        except Exception as e:
-            print(f"    [警告] ラベル取得失敗: {e}")
+            label_value = _label_from_timestamp(timestamp, pcap_filename)
+        except Exception:
             label_value = "BENIGN"
 
-        # 画像データ生成
-        for j, packet in enumerate(chunk):
-            packet_bytes = packet['bytes']
-            header = packet_bytes[:image_dim]
-            padded = header.ljust(image_dim, b'\xff')
-            image_data[j] = np.frombuffer(padded, dtype=np.uint8)
+        # 画像データ生成 (初期値黒)
+        image_data = np.zeros((image_dim, image_dim), dtype=np.uint8)
 
-        # 正規化（オプション: コメントを外すと有効化）
-        # image_data = normalize_image(image_data)
+        for j, pkt in enumerate(chunk):
+            raw_bytes = pkt["bytes"]
+
+            # ★ ここでヘッダのみ抽出
+            header_bytes = extract_headers(raw_bytes)
+
+            # 長さが足りない部分は黒(0x00)で埋める
+            padded = header_bytes[:image_dim].ljust(image_dim, b"\x00")
+
+            image_data[j] = np.frombuffer(padded, dtype=np.uint8)
 
         images_with_labels.append((image_data, label_value))
 
     return images_with_labels
 
 
-def normalize_image(image_data):
-    """
-    画像を正規化（Min-Max正規化）
+def save_images(images_with_labels, pcap_name, is_train, label_counters):
+    saved_counts = defaultdict(int)
 
-    効果: モデルの学習を安定化
-    """
-    min_val = image_data.min()
-    max_val = image_data.max()
-
-    if max_val > min_val:
-        normalized = (image_data - min_val) / (max_val - min_val) * 255
-    else:
-        normalized = image_data
-
-    return normalized.astype(np.uint8)
-
-
-def save_images_with_limit(images_with_labels, pcap_name, is_train_file, label_counts):
-    """
-    画像を保存（データ不均衡対策付き）
-
-    修正点:
-    - ラベルごとの最大画像数を制限
-    - 既存ファイルチェックを先に実行
-    """
-    saved_counts = {"train/good": 0, "test/good": 0}
-    attack_counts = {}
-    skipped_existing = 0
-    skipped_limit = 0
-
-    for idx, (image_data, label_value) in enumerate(images_with_labels):
-        # ラベルキーを作成
-        if is_train_file:
-            label_key = f"{label_value}_train"
-        else:
-            label_key = f"{label_value}_test"
-
-        # 最大画像数チェック
-        max_count = MAX_IMAGES_PER_LABEL.get(
-            label_key,
-            MAX_IMAGES_PER_LABEL["default"]
-        )
-
-        if label_counts.get(label_key, 0) >= max_count:
-            skipped_limit += 1
-            continue
-
-        # ファイルパスとディレクトリを決定
-        if is_train_file:
-            if label_value == "BENIGN":
-                out_dir = TRAIN_GOOD
-                filename = f"{pcap_name}_train_{idx:06d}.png"
-                count_key = "train/good"
+    for idx, (data, lbl) in enumerate(images_with_labels):
+        if lbl == "BENIGN":
+            if is_train:
+                key, max_c, d = "train_good", MAX_IMAGES_TRAIN_GOOD, TRAIN_GOOD
             else:
-                # 学習データに攻撃は含めない
+                key, max_c, d = "test_good", MAX_IMAGES_TEST_GOOD, TEST_GOOD
+            fname = f"{pcap_name}_{key}_{idx:06d}.png"
+        else:
+            if is_train:
                 continue
-        else:
-            if label_value == "BENIGN":
-                out_dir = TEST_GOOD
-                filename = f"{pcap_name}_test_good_{idx:06d}.png"
-                count_key = "test/good"
-            else:
-                sanitized_label = sanitize_label(label_value)
-                out_dir = os.path.join(TEST_ANOM_ROOT, sanitized_label)
-                filename = f"{pcap_name}_{sanitized_label}_{idx:06d}.png"
-                count_key = None
+            key = f"test_anom_{lbl}"
+            max_c = MAX_IMAGES_PER_ATTACK_TEST
+            s_lbl = sanitize_label(lbl)
+            d = os.path.join(TEST_ANOM_ROOT, s_lbl)
+            fname = f"{pcap_name}_{s_lbl}_{idx:06d}.png"
 
-        os.makedirs(out_dir, exist_ok=True)
-        filepath = os.path.join(out_dir, filename)
-
-        # 既存ファイルチェック（画像生成前）
-        if os.path.exists(filepath):
-            skipped_existing += 1
-            # カウントは増やす（制限チェック用）
-            label_counts[label_key] = label_counts.get(label_key, 0) + 1
+        if label_counters[key] >= max_c:
             continue
 
-        # 画像生成と保存
-        img = Image.fromarray(image_data, 'L')
-        img.save(filepath)
+        os.makedirs(d, exist_ok=True)
+        path = os.path.join(d, fname)
 
-        # カウント更新
-        label_counts[label_key] = label_counts.get(label_key, 0) + 1
+        if not os.path.exists(path):
+            Image.fromarray(data, "L").save(path)
+            label_counters[key] += 1
+            saved_counts[key] += 1
 
-        if count_key:
-            saved_counts[count_key] += 1
-        else:
-            sanitized_label = sanitize_label(label_value)
-            attack_counts[sanitized_label] = attack_counts.get(
-                sanitized_label, 0) + 1
-
-    if skipped_existing > 0:
-        print(f"    既存ファイルスキップ: {skipped_existing:,}枚")
-    if skipped_limit > 0:
-        print(f"    制限によるスキップ: {skipped_limit:,}枚")
-
-    return saved_counts, attack_counts
-
-
-def process_pcap_in_batches(pcap_path, is_train, time_filter=None, batch_size=100000):
-    """
-    pcapファイルをバッチ処理（メモリ効率化）
-
-    修正点:
-    - 全パケットを一度に読み込まない
-    - バッチごとに処理してメモリを解放
-    """
-    pcap_basename = os.path.basename(pcap_path)
-    pcap_name = os.path.splitext(pcap_basename)[0]
-
-    print(f"\n処理中: {pcap_basename} ({'学習用' if is_train else 'テスト用'})")
-    if time_filter:
-        print(f"  時刻フィルタ: {time_filter[0]}時 〜 {time_filter[1]}時")
-
-    label_counts = {}  # ラベルごとのカウント
-    total_saved_counts = {"train/good": 0, "test/good": 0}
-    total_attack_counts = {}
-
-    # パケットをバッチで読み込み
-    packet_count = 0
-    batch_num = 0
-
-    # 簡易的なバッチ処理（same.read_packet_dpktを1回だけ呼ぶ）
-    # 本格的にはジェネレータ化が必要だが、ここでは既存コードとの互換性を優先
-    print("  パケット読み込み中...")
-
-    # same.read_packet_dpktの引数を確認して適切に呼び出し
-    try:
-        # 引数名がtz_offsetの場合
-        packets = same.read_packet_dpkt(
-            pcap_path,
-            time_filter=time_filter,
-            count_limit=None,
-            tz_offset=-3
-        )
-    except TypeError:
-        # 引数名がtz_offset_hoursの場合
-        try:
-            packets = same.read_packet_dpkt(
-                pcap_path,
-                time_filter=time_filter,
-                count_limit=None,
-                tz_offset_hours=-3
-            )
-        except TypeError:
-            # どちらもダメな場合は引数なしで呼び出し
-            packets = same.read_packet_dpkt(
-                pcap_path,
-                time_filter=time_filter,
-                count_limit=None
-            )
-
-    if not packets:
-        print("  警告: パケットが読み込めませんでした")
-        return total_saved_counts, total_attack_counts
-
-    print(f"  総パケット数: {len(packets):,}")
-    print(f"  画像生成中...")
-
-    # バッチ処理
-    for i in tqdm(range(0, len(packets), batch_size), desc="  バッチ処理"):
-        batch = packets[i:i + batch_size]
-
-        # 画像生成（時系列順、IPペアでグループ化しない）
-        images_with_labels = packet_batch_to_images(
-            batch, pcap_path, image_dim=IMAGE_DIM
-        )
-
-        # 画像保存
-        counts, attack_counts = save_images_with_limit(
-            images_with_labels, pcap_name, is_train, label_counts
-        )
-
-        # 集計
-        for k in counts:
-            total_saved_counts[k] += counts[k]
-        for atk, c in attack_counts.items():
-            total_attack_counts[atk] = total_attack_counts.get(atk, 0) + c
-
-        batch_num += 1
-
-    # ラベル集計を表示
-    print(f"  [ラベル集計]")
-    for lbl, count in sorted(label_counts.items()):
-        print(f"    {lbl}: {count:,}枚")
-
-    print("  ✓ 処理完了")
-
-    return total_saved_counts, total_attack_counts
+    return saved_counts
 
 
 def main():
     print("=" * 80)
-    print("pcap → グレースケール画像変換（修正版）")
-    print("=" * 80)
-    print("\n修正内容:")
-    print("  ✓ データリーク対策: IPペアでグループ化しない")
-    print("  ✓ メモリ効率化: バッチ処理")
-    print("  ✓ データ不均衡対策: ラベルごとの最大画像数制限")
-    print("  ✓ 進捗表示の追加")
+    print("🔹 pcap → グレースケール画像変換 (Header Only版)")
     print("=" * 80)
 
     pcap_files = [
-        {"path": os.path.join(PCAP_DIR, "Monday-WorkingHours.pcap"),
-         "is_train": True,
-         "time_filter": None},
-
-        {"path": os.path.join(PCAP_DIR, "Tuesday-WorkingHours.pcap"),
-         "is_train": False,
-         "time_filter": None},
-
-        {"path": os.path.join(PCAP_DIR, "Wednesday-workingHours.pcap"),
-         "is_train": False,
-         "time_filter": None},
-
-        {"path": os.path.join(PCAP_DIR, "Thursday-WorkingHours.pcap"),
-         "is_train": False,
-         "time_filter": None},
-
-        {"path": os.path.join(PCAP_DIR, "Friday-WorkingHours.pcap"),
-         "is_train": False,
-         "time_filter": None},
+        {"path": os.path.join(PCAP_DIR, f), "is_train": False}
+        for f in os.listdir(PCAP_DIR) if f.endswith(".pcap")
     ]
 
-    total_counts = {"train/good": 0, "test/good": 0}
-    all_attack_counts = {}
+    train_files, test_files = split_pcap_files(pcap_files, TRAIN_RATIO)
+    all_files = train_files + test_files
+    label_counters = defaultdict(int)
 
-    for info in pcap_files:
-        pcap_path = info["path"]
-        is_train = info["is_train"]
-        time_filter = info.get("time_filter")
-
-        if not os.path.exists(pcap_path):
-            print(f"\nスキップ: {pcap_path} が見つかりません")
+    print("Phase 1: 画像生成")
+    for info in all_files:
+        path = info["path"]
+        if not os.path.exists(path):
+            print(f"Skip: {path}")
             continue
 
-        # バッチ処理で実行
-        counts, attack_counts = process_pcap_in_batches(
-            pcap_path, is_train, time_filter
-        )
+        print(
+            f"\n処理中: {os.path.basename(path)} ({'Train' if info['is_train'] else 'Test'})")
 
-        for k in counts:
-            total_counts[k] += counts[k]
-        for atk, c in attack_counts.items():
-            all_attack_counts[atk] = all_attack_counts.get(atk, 0) + c
+        try:
+            packets = same.read_packet_dpkt(path, tz_offset=TZ_OFFSET_HOURS)
+        except:
+            continue
 
-    # 最終結果表示
-    print("\n" + "=" * 80)
-    print("グレースケール画像変換完了！")
-    print("=" * 80)
-    print(f"\n【学習用データ】")
-    print(f"  train/good: {total_counts['train/good']:,}枚")
-    print(f"\n【テスト用データ】")
-    print(f"  test/good: {total_counts['test/good']:,}枚")
+        if not packets:
+            continue
+        traffic = same.group_packets_dpkt(packets)
 
-    if all_attack_counts:
-        print(f"\n【攻撃タイプ別】")
-        total_anomaly = sum(all_attack_counts.values())
-        for atk in sorted(all_attack_counts.keys()):
-            print(f"  {atk:30s}: {all_attack_counts[atk]:,}枚")
-        print(f"  {'合計':30s}: {total_anomaly:,}枚")
+        for _, pkts in tqdm(traffic.items(), leave=False):
+            imgs = packet_list_to_gray_images(pkts, path, IMAGE_DIM)
+            if imgs:
+                save_images(imgs, os.path.splitext(os.path.basename(path))[0],
+                            info["is_train"], label_counters)
 
-    print(f"\n📁 出力先: {OUT_ROOT}/")
-    print("   ├── train/good/")
-    print("   └── test/")
-    print("       ├── good/")
-    print("       └── anomaly/")
-    print("           ├── DDoS/")
-    print("           ├── PortScan/")
-    print("           └── ...")
-    print("=" * 80)
+    if MOVE_RATIO_FROM_TEST_TO_TRAIN > 0:
+        redistribute_test_to_train(
+            TEST_GOOD, TRAIN_GOOD, MOVE_RATIO_FROM_TEST_TO_TRAIN)
+
+    print("\n完了")
+    print(f"出力先: {OUT_ROOT}")
+
+
+def redistribute_test_to_train(test_dir, train_dir, ratio):
+    print("\n再配分処理...")
+    if not os.path.exists(test_dir):
+        return
+    os.makedirs(train_dir, exist_ok=True)
+    files = [f for f in os.listdir(test_dir) if f.endswith('.png')]
+    random.shuffle(files)
+    count = int(len(files) * ratio)
+    for f in files[:count]:
+        try:
+            shutil.move(os.path.join(test_dir, f), os.path.join(train_dir, f))
+        except:
+            pass
+    print(f"{count}枚を train へ移動")
 
 
 if __name__ == "__main__":
