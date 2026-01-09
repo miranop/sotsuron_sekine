@@ -1,0 +1,11 @@
+datasets/
+datasets_change/
+CSV/
+Pcap/
+__pycache__/
+*.pyc
+*.pyo
+.git/
+.gitignore
+.devcontainer
+README.md

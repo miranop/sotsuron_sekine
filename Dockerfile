@@ -1,31 +1,41 @@
-FROM python:3.11-slim
+FROM nvidia/cuda:12.1.1-cudnn8-devel-ubuntu22.04
 
-WORKDIR /app
+# 基本
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    python3 python3-pip python3-venv git wget unzip nano vim \
+    libgl1-mesa-glx libglib2.0-0 ffmpeg && \
+    rm -rf /var/lib/apt/lists/*
 
-# システムライブラリ
-RUN apt-get update && apt-get install -y \
-    gcc g++ git curl wget \
-    libglib2.0-0 libgl1-mesa-glx \
-    # 追加: 画像処理用ライブラリ
-    libjpeg-dev libpng-dev libfreetype6-dev \
-    && rm -rf /var/lib/apt/lists/*
+RUN ln -s /usr/bin/python3 /usr/bin/python
+RUN pip install --upgrade pip
 
-# Pythonライブラリを段階的にインストール
-RUN pip install --no-cache-dir --upgrade pip
+# PyTorch (CUDA12)
+RUN pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
 
-# PyTorch (CPU版)
-RUN pip install --no-cache-dir torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu
+# Anomalib & CV
+RUN pip install \
+    anomalib \
+    opencv-python \
+    scikit-learn \
+    scikit-image \
+    matplotlib \
+    seaborn \
+    pillow \
+    tqdm \
+    pandas \
+    numpy \
+    einops \
+    wandb \
+    tensorboard
 
-# Lightning関連（両方必要）
-RUN pip install --no-cache-dir pytorch-lightning lightning torchmetrics
+# あなた用の追加ツール（GAF / RP）
+RUN pip install \
+    pyts
 
-# 基本ライブラリ
-RUN pip install --no-cache-dir numpy pillow matplotlib opencv-python-headless
+# コードを内包する場所
+WORKDIR /workspace
 
-# 追加の必要ライブラリ（今回の経験から）
-RUN pip install --no-cache-dir kornia scikit-learn scikit-image
+# test_code を丸ごとコピー
+COPY ./test_code /workspace/test_code
 
-# anomalib（最後に）
-RUN pip install --no-cache-dir "anomalib[full]"
-
-CMD ["python"]
+CMD ["/bin/bash"]
